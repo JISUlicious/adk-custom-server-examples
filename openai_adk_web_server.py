@@ -27,6 +27,9 @@ from google.adk.cli.adk_web_server import AdkWebServer
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.utils.context_utils import Aclosing
 
+from database_memory_service import DatabaseMemoryService
+from database_session_service import DatabaseSessionService
+
 logger = logging.getLogger("google_adk." + __name__)
 
 
@@ -700,7 +703,14 @@ if __name__ == "__main__":
     # Example: Create and run the server
     server = create_openai_adk_server(
         agents_dir="./",
-        default_app_name=None  # Will use first available app
+        default_app_name=None,
+        memory_service=DatabaseMemoryService(
+            database_url="sqlite:///memory.db"
+        ),
+        session_service=DatabaseSessionService(
+            database_url="sqlite:///session.db"
+        ),
+
     )
 
     app = server.get_fast_api_app(
