@@ -30,6 +30,14 @@ from google.adk.utils.context_utils import Aclosing
 from database_memory_service import DatabaseMemoryService
 from database_session_service import DatabaseSessionService
 
+# Authorization imports
+from authorization import (
+    AuthorizationPlugin,
+    StaticPIP,
+    Policy,
+    PolicyRule,
+)
+
 logger = logging.getLogger("google_adk." + __name__)
 
 
@@ -144,6 +152,7 @@ class OpenAIAdkWebServer(AdkWebServer):
         *,
         default_app_name: Optional[str] = None,
         default_user_id: str = "openai_user",
+        policies: Optional[Dict[str, Policy]] = None,
         **kwargs
     ):
         """
@@ -153,12 +162,39 @@ class OpenAIAdkWebServer(AdkWebServer):
             default_app_name: Default ADK app to use when model name doesn't
                 match any app. If None, first available app is used.
             default_user_id: Default user ID for OpenAI requests.
+            policies: Optional dict of authorization policies for agents/tools.
+                Keys should be "resource_type:resource_name" (e.g., "agent:admin_agent").
             **kwargs: Arguments passed to parent AdkWebServer.
         """
         super().__init__(**kwargs)
         self.default_app_name = default_app_name
         self.default_user_id = default_user_id
         self._session_cache: Dict[str, str] = {}  # Maps user+model to session_id
+
+        # Setup authorization if policies are configured
+        self.policies = policies or {}
+        self._pip = StaticPIP(policies=self.policies) if self.policies else None
+        self._auth_plugin = AuthorizationPlugin(pip=self._pip) if self._pip else None
+
+    async def get_runner_async(self, app_name: str):
+        """
+        Get a runner for the specified app, with authorization plugin if configured.
+
+        Overrides parent method to inject AuthorizationPlugin when policies are set.
+        """
+        runner = await super().get_runner_async(app_name)
+
+        # Add authorization plugin if configured
+        if self._auth_plugin:
+            # Check if plugin is already added (avoid duplicates)
+            has_auth_plugin = any(
+                isinstance(p, AuthorizationPlugin) for p in runner._plugins
+            )
+            if not has_auth_plugin:
+                runner._plugins.append(self._auth_plugin)
+                logger.debug(f"Authorization plugin added to runner for app: {app_name}")
+
+        return runner
 
     def _get_app_name_for_model(self, model: str) -> str:
         """
@@ -193,7 +229,7 @@ class OpenAIAdkWebServer(AdkWebServer):
         self,
         app_name: str,
         user_id: str,
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
     ) -> str:
         """
         Get existing session or create a new one.
@@ -220,7 +256,7 @@ class OpenAIAdkWebServer(AdkWebServer):
         session = await self.session_service.create_session(
             app_name=app_name,
             user_id=user_id,
-            session_id=session_id or f"openai_{uuid.uuid4().hex[:12]}"
+            session_id=session_id or f"openai_{uuid.uuid4().hex[:12]}",
         )
         return session.id
 
@@ -461,14 +497,14 @@ class OpenAIAdkWebServer(AdkWebServer):
                 # Map model to app name (supports both 'model' and 'appName')
                 app_name = self._get_app_name_for_model(request.effective_model)
 
-                # Get user ID (supports both 'user' and 'userId')
+                # Get user ID from request or use default
                 user_id = request.effective_user or self.default_user_id
 
                 # Get or create session (supports both 'session_id' and 'sessionId')
                 session_id = await self._get_or_create_session(
                     app_name=app_name,
                     user_id=user_id,
-                    session_id=request.effective_session_id
+                    session_id=request.effective_session_id,
                 )
 
                 # Convert messages to ADK format
@@ -633,6 +669,7 @@ class OpenAIAdkWebServer(AdkWebServer):
 def create_openai_adk_server(
     agents_dir: str,
     default_app_name: Optional[str] = None,
+    policies: Optional[Dict[str, Policy]] = None,
     **kwargs
 ) -> OpenAIAdkWebServer:
     """
@@ -641,6 +678,8 @@ def create_openai_adk_server(
     Args:
         agents_dir: Directory containing ADK agents
         default_app_name: Default app to use for OpenAI requests
+        policies: Optional dict of authorization policies for agents/tools.
+            Keys should be "resource_type:resource_name" (e.g., "agent:admin_agent").
         **kwargs: Additional arguments for services
 
     Returns:
@@ -648,11 +687,27 @@ def create_openai_adk_server(
 
     Example:
         from openai_adk_web_server import create_openai_adk_server
+        from authorization import Policy, PolicyRule
 
+        # Without authorization
         server = create_openai_adk_server(
             agents_dir="./agents",
             default_app_name="my_agent"
         )
+
+        # With authorization policies
+        policies = {
+            "agent:admin_agent": Policy(
+                resource_type="agent",
+                resource_name="admin_agent",
+                rules=[PolicyRule(type="rbac", required_roles=["admin"])]
+            ),
+        }
+        server = create_openai_adk_server(
+            agents_dir="./agents",
+            policies=policies,
+        )
+
         app = server.get_fast_api_app(allow_origins=["*"])
 
         # Run with uvicorn
@@ -690,6 +745,7 @@ def create_openai_adk_server(
         eval_set_results_manager=eval_set_results_manager,
         agents_dir=agents_dir,
         default_app_name=default_app_name,
+        policies=policies,
     )
 
 
