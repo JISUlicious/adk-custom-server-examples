@@ -231,7 +231,7 @@ class CustomWebServer:
 
         # Close all asyncpg pools
         try:
-            from database_pool import AsyncPgPool
+            from custom_services.database_pool import AsyncPgPool
             await AsyncPgPool.close_all()
             logger.info("All database pools closed")
         except ImportError:
@@ -333,14 +333,14 @@ def create_server(
 
     # Create session service
     if session_db_url:
-        from database_session_service import DatabaseSessionService
+        from custom_services.database_session_service import DatabaseSessionService
         session_service = DatabaseSessionService(session_db_url)
     else:
         session_service = InMemorySessionService()
 
     # Create memory service
     if memory_db_url:
-        from database_memory_service import DatabaseMemoryService
+        from custom_services.database_memory_service import DatabaseMemoryService
         memory_service = DatabaseMemoryService(memory_db_url)
     else:
         memory_service = InMemoryMemoryService()
