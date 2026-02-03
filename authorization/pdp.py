@@ -8,8 +8,6 @@ The PDP is responsible for making authorization decisions based on:
 """
 
 import logging
-from typing import Optional
-
 from .models import (
     UserContext,
     ResourceContext,
