@@ -51,8 +51,8 @@ from custom_web_server import (
     ServiceContainer,
     DefaultRunnerFactory,
 )
-from database_session_service import DatabaseSessionService
-from database_memory_service import DatabaseMemoryService
+from custom_services.database_session_service import DatabaseSessionService
+from custom_services.database_memory_service import DatabaseMemoryService
 
 # Optional: Import authorization if you want to use policies
 # from authorization import AuthorizationPlugin, StaticPIP, Policy, PolicyRule
