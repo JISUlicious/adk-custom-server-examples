@@ -10,6 +10,7 @@ Provides:
 """
 
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -101,6 +102,9 @@ class CustomWebServer:
         self._runner_factory = runner_factory
         self._runner_cache: Dict[str, Runner] = {}
 
+        # Store services container for lifecycle management
+        self._services = services
+
         # Services for direct endpoint access (session CRUD, artifacts, etc.)
         self.session_service = services.session_service
         self.memory_service = services.memory_service
@@ -145,6 +149,17 @@ class CustomWebServer:
 
         return runner
 
+    def _create_lifespan(self):
+        """Create lifespan context manager for FastAPI."""
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            # Startup: Initialize database services
+            await self._start_services()
+            yield
+            # Shutdown: Close database services
+            await self._stop_services()
+        return lifespan
+
     def create_app(self) -> FastAPI:
         """
         Create the FastAPI application.
@@ -156,6 +171,7 @@ class CustomWebServer:
             title="ADK Web Server",
             description="ADK Web Server with OpenAI-compatible API",
             version="1.0.0",
+            lifespan=self._create_lifespan(),
         )
 
         # Add CORS middleware
@@ -188,6 +204,38 @@ class CustomWebServer:
         logger.info("FastAPI app created with %d routes", len(app.routes))
 
         return app
+
+    async def _start_services(self) -> None:
+        """Start database services (connection pools, etc.)."""
+        # Start session service if it has a start method (PostgreSQL)
+        if hasattr(self.session_service, 'start'):
+            await self.session_service.start()
+            logger.info("Session service started")
+
+        # Start memory service if it has a start method (PostgreSQL)
+        if self.memory_service and hasattr(self.memory_service, 'start'):
+            await self.memory_service.start()
+            logger.info("Memory service started")
+
+    async def _stop_services(self) -> None:
+        """Stop database services and close connection pools."""
+        # Close session service if it has a close method
+        if hasattr(self.session_service, 'close'):
+            await self.session_service.close()
+            logger.info("Session service closed")
+
+        # Close memory service if it has a close method
+        if self.memory_service and hasattr(self.memory_service, 'close'):
+            await self.memory_service.close()
+            logger.info("Memory service closed")
+
+        # Close all asyncpg pools
+        try:
+            from database_pool import AsyncPgPool
+            await AsyncPgPool.close_all()
+            logger.info("All database pools closed")
+        except ImportError:
+            pass
 
     def _mount_web_ui(self, app: FastAPI) -> None:
         """Mount ADK web UI static files."""

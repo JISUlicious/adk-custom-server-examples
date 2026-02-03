@@ -14,8 +14,18 @@ Environment variables (can be set in .env file):
     WEB_UI_ENABLED  - Enable ADK Web UI (default: true)
     RELOAD          - Enable auto-reload (default: false)
 
+Database Support:
+    - SQLite: Works out of the box (sync initialization)
+    - PostgreSQL: Uses asyncpg with connection pooling (async initialization)
+      The server automatically starts/stops connection pools via FastAPI lifespan.
+
 Examples:
-    # Run with defaults
+    # Run with defaults (SQLite)
+    python main.py
+
+    # With PostgreSQL
+    export SESSION_DB_URL="postgresql://user:pass@localhost/db"
+    export MEMORY_DB_URL="postgresql://user:pass@localhost/db"
     python main.py
 
     # Custom port (CLI overrides .env)

@@ -31,8 +31,8 @@ class PolicyDecisionPoint:
     Example:
         pdp = PolicyDecisionPoint()
 
-        user = SimpleUserContext(user_id="bob", roles={"admin"})
-        resource = SimpleResourceContext.for_tool("delete_user")
+        user = UserContext(user_id="bob", roles={"admin"})
+        resource = ResourceContext.for_tool("delete_user")
         policy = Policy(
             resource_type="tool",
             resource_name="delete_user",

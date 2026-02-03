@@ -37,7 +37,7 @@ class AuthorizationPlugin(BasePlugin):
     - before_tool_callback: Check if user can access tool via PDP
 
     Example:
-        from authorization import SimpleAuthorizationPlugin, StaticPIP, Policy, PolicyRule
+        from authorization import AuthorizationPlugin, StaticPIP, Policy, PolicyRule
 
         # Define policies
         policies = {
@@ -50,13 +50,13 @@ class AuthorizationPlugin(BasePlugin):
 
         # Define users
         users = {
-            "alice": SimpleUserContext(user_id="alice", roles={"analyst"}),
-            "bob": SimpleUserContext(user_id="bob", roles={"admin"}),
+            "alice": UserContext(user_id="alice", roles={"analyst"}),
+            "bob": UserContext(user_id="bob", roles={"admin"}),
         }
 
         # Create PIP and plugin
         pip = StaticPIP(policies=policies, users=users)
-        auth_plugin = SimpleAuthorizationPlugin(pip=pip)
+        auth_plugin = AuthorizationPlugin(pip=pip)
 
         # Add to runner
         runner = Runner(app=my_app, plugins=[auth_plugin])
@@ -68,7 +68,7 @@ class AuthorizationPlugin(BasePlugin):
         pdp: Optional[PolicyDecisionPoint] = None,
         require_auth: bool = True,
         default_allow: bool = True,
-        name: str = "simple_authorization",
+        name: str = "authorization",
     ):
         """
         Initialize the simple authorization plugin.
@@ -78,7 +78,7 @@ class AuthorizationPlugin(BasePlugin):
             pdp: Policy Decision Point for evaluating rules (defaults to PolicyDecisionPoint)
             require_auth: If True, authentication is required (default: True)
             default_allow: If True, allow access when no policy exists (default: True)
-            name: Plugin name (default: "simple_authorization")
+            name: Plugin name (default: "authorization")
         """
         super().__init__(name)
         self.pip = pip
@@ -259,9 +259,9 @@ class AuthorizationPlugin(BasePlugin):
     async def start(self) -> None:
         """Start the plugin (start PIP)."""
         await self.pip.start()
-        logger.info("SimpleAuthorizationPlugin started")
+        logger.info("AuthorizationPlugin started")
 
     async def stop(self) -> None:
         """Stop the plugin (stop PIP)."""
         await self.pip.stop()
-        logger.info("SimpleAuthorizationPlugin stopped")
+        logger.info("AuthorizationPlugin stopped")

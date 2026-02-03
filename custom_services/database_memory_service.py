@@ -3,20 +3,28 @@ Database-backed Memory Service for Google ADK
 
 This module provides a persistent memory service that stores session events
 in a database instead of in-memory storage. Supports SQLite (default) and
-PostgreSQL (using psycopg3).
+PostgreSQL (using asyncpg).
 
 Features:
 - Persistent storage across restarts
 - Full-text search (FTS5 for SQLite, tsvector for PostgreSQL)
 - Thread-safe operations
-- psycopg3 (psycopg) for PostgreSQL connections
+- asyncpg for PostgreSQL connections (async, high-performance)
 
 Requirements:
 - SQLite: Built-in (no additional dependencies)
-- PostgreSQL: pip install psycopg[binary]
+- PostgreSQL: pip install asyncpg
 
-Author: Claude
-Date: 2025-01-26
+Usage:
+    # SQLite
+    memory_service = DatabaseMemoryService("sqlite:///memory.db")
+
+    # PostgreSQL (requires calling start() before use)
+    memory_service = DatabaseMemoryService("postgresql://user:pass@host/db")
+    await memory_service.start()  # Initialize connection pool
+
+    # On shutdown
+    await memory_service.close()
 """
 
 from __future__ import annotations
@@ -179,7 +187,10 @@ def content_to_json(content: types.Content) -> str:
 
 def json_to_content(json_str: str) -> types.Content:
     """Deserialize JSON to Content object."""
-    data = json.loads(json_str)
+    if isinstance(json_str, dict):
+        data = json_str  # asyncpg returns JSONB as dict directly
+    else:
+        data = json.loads(json_str)
 
     parts = []
     for part_dict in data.get("parts", []):
@@ -224,10 +235,11 @@ class DatabaseMemoryService(BaseMemoryService):
             database_url="sqlite:///memory.db"
         )
 
-        # PostgreSQL
+        # PostgreSQL (requires start() before use)
         memory_service = DatabaseMemoryService(
             database_url="postgresql://user:pass@localhost/dbname"
         )
+        await memory_service.start()
 
         # In-memory SQLite (for testing)
         memory_service = DatabaseMemoryService(
@@ -253,13 +265,48 @@ class DatabaseMemoryService(BaseMemoryService):
         self.max_results = max_results
         self._is_postgresql = database_url.startswith("postgresql")
         self._is_memory = ":memory:" in database_url
-        self._persistent_connection = None  # For in-memory databases
+        self._persistent_connection = None  # For in-memory SQLite databases
 
-        # Initialize database
-        self._init_database()
+        # For PostgreSQL, use shared pool from database_pool module
+        self._pool = None  # asyncpg.Pool, set in start()
+        self._started = False
+
+        # Initialize SQLite immediately (sync), PostgreSQL requires start()
+        if not self._is_postgresql:
+            self._init_sqlite()
+
+    async def start(self) -> None:
+        """Initialize PostgreSQL connection pool and schema.
+
+        Must be called before using the service with PostgreSQL.
+        For SQLite, this is a no-op as initialization happens in __init__.
+        """
+        if self._started:
+            return
+
+        if self._is_postgresql:
+            from database_pool import AsyncPgPool
+            self._pool = await AsyncPgPool.get_pool(self.database_url)
+            await self._init_postgres()
+
+        self._started = True
+        logger.info("DatabaseMemoryService started: %s", self.database_url[:50])
+
+    async def close(self) -> None:
+        """Close database connections.
+
+        For SQLite in-memory, closes the persistent connection.
+        For PostgreSQL, the pool is managed by AsyncPgPool.close_all().
+        """
+        if self._persistent_connection:
+            self._persistent_connection.close()
+            self._persistent_connection = None
+
+        self._started = False
+        logger.info("DatabaseMemoryService closed")
 
     def _get_connection(self):
-        """Get database connection (sync, for SQLite)."""
+        """Get SQLite database connection (sync)."""
         import sqlite3
         # For in-memory databases, reuse the same connection
         if self._is_memory:
@@ -293,45 +340,28 @@ class DatabaseMemoryService(BaseMemoryService):
             if not self._is_memory and not self._is_postgresql:
                 conn.close()
 
-    @contextmanager
-    def _get_pg_cursor(self):
-        """Context manager for PostgreSQL database cursor (using psycopg3)."""
-        import psycopg
-        from psycopg.rows import dict_row
+    def _init_sqlite(self):
+        """Initialize SQLite database schema."""
+        with self._get_cursor() as cursor:
+            # SQLite needs to execute statements one by one
+            for statement in SQLITE_SCHEMA.split(";"):
+                statement = statement.strip()
+                if statement:
+                    try:
+                        cursor.execute(statement)
+                    except Exception as e:
+                        # Ignore errors for "IF NOT EXISTS" statements
+                        if "already exists" not in str(e).lower():
+                            logger.debug(f"Schema statement skipped: {e}")
 
-        conn = psycopg.connect(self.database_url, row_factory=dict_row)
-        try:
-            cursor = conn.cursor()
-            yield cursor
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            cursor.close()
-            conn.close()
+        logger.info(f"SQLite database initialized: {self.database_url}")
 
-    def _init_database(self):
-        """Initialize database schema."""
-        schema = POSTGRESQL_SCHEMA if self._is_postgresql else SQLITE_SCHEMA
+    async def _init_postgres(self):
+        """Initialize PostgreSQL database schema."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(POSTGRESQL_SCHEMA)
 
-        if self._is_postgresql:
-            with self._get_pg_cursor() as cursor:
-                cursor.execute(schema)
-        else:
-            with self._get_cursor() as cursor:
-                # SQLite needs to execute statements one by one
-                for statement in schema.split(";"):
-                    statement = statement.strip()
-                    if statement:
-                        try:
-                            cursor.execute(statement)
-                        except Exception as e:
-                            # Ignore errors for "IF NOT EXISTS" statements
-                            if "already exists" not in str(e).lower():
-                                logger.debug(f"Schema statement skipped: {e}")
-
-        logger.info(f"Database initialized: {self.database_url}")
+        logger.info(f"PostgreSQL database initialized: {self.database_url[:50]}...")
 
     @override
     async def add_session_to_memory(self, session: Session):
@@ -396,42 +426,35 @@ class DatabaseMemoryService(BaseMemoryService):
                 ))
 
     async def _add_session_to_memory_pg(self, session: Session):
-        """Add session to PostgreSQL database (using psycopg3)."""
-        with self._get_pg_cursor() as cursor:
-            cursor.execute("""
-                INSERT INTO memory_sessions (app_name, user_id, session_id, updated_at)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (app_name, user_id, session_id)
-                DO UPDATE SET updated_at = EXCLUDED.updated_at
-                RETURNING id
-            """, (session.app_name, session.user_id, session.id, datetime.now(timezone.utc)))
-            row = cursor.fetchone()
-            session_pk = row['id'] if isinstance(row, dict) else row[0]
+        """Add session to PostgreSQL database."""
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow("""
+                    INSERT INTO memory_sessions (app_name, user_id, session_id, updated_at)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (app_name, user_id, session_id)
+                    DO UPDATE SET updated_at = EXCLUDED.updated_at
+                    RETURNING id
+                """, session.app_name, session.user_id, session.id, datetime.now(timezone.utc))
+                session_pk = row['id']
 
-            cursor.execute("DELETE FROM memory_events WHERE session_pk = %s", (session_pk,))
+                await conn.execute("DELETE FROM memory_events WHERE session_pk = $1", session_pk)
 
-            for event in session.events:
-                if not event.content or not event.content.parts:
-                    continue
+                for event in session.events:
+                    if not event.content or not event.content.parts:
+                        continue
 
-                content_json = content_to_json(event.content)
-                content_text = extract_text_from_content(event.content)
+                    content_json = content_to_json(event.content)
+                    content_text = extract_text_from_content(event.content)
 
-                if not content_text:
-                    continue
+                    if not content_text:
+                        continue
 
-                cursor.execute("""
-                    INSERT INTO memory_events
-                    (session_pk, event_id, author, timestamp, content_json, content_text)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                """, (
-                    session_pk,
-                    event.id,
-                    event.author,
-                    event.timestamp,
-                    content_json,
-                    content_text
-                ))
+                    await conn.execute("""
+                        INSERT INTO memory_events
+                        (session_pk, event_id, author, timestamp, content_json, content_text)
+                        VALUES ($1, $2, $3, $4, $5, $6)
+                    """, session_pk, event.id, event.author, event.timestamp, content_json, content_text)
 
     @override
     async def search_memory(
@@ -455,7 +478,7 @@ class DatabaseMemoryService(BaseMemoryService):
             return SearchMemoryResponse()
 
         if self._is_postgresql:
-            response = self._search_memory_pg(app_name, user_id, query)
+            response = await self._search_memory_pg(app_name, user_id, query)
         else:
             response = self._search_memory_sqlite(app_name, user_id, query)
 
@@ -502,24 +525,22 @@ class DatabaseMemoryService(BaseMemoryService):
 
         return response
 
-    def _search_memory_pg(
+    async def _search_memory_pg(
         self, app_name: str, user_id: str, query: str
     ) -> SearchMemoryResponse:
         """Search memories in PostgreSQL using tsvector."""
         response = SearchMemoryResponse()
 
-        with self._get_pg_cursor() as cursor:
-            cursor.execute("""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
                 SELECT e.content_json, e.author, e.timestamp
                 FROM memory_events e
                 JOIN memory_sessions s ON e.session_pk = s.id
-                WHERE s.app_name = %s AND s.user_id = %s
-                AND e.content_tsv @@ plainto_tsquery('english', %s)
-                ORDER BY ts_rank(e.content_tsv, plainto_tsquery('english', %s)) DESC
-                LIMIT %s
-            """, (app_name, user_id, query, query, self.max_results))
-
-            rows = cursor.fetchall()
+                WHERE s.app_name = $1 AND s.user_id = $2
+                AND e.content_tsv @@ plainto_tsquery('english', $3)
+                ORDER BY ts_rank(e.content_tsv, plainto_tsquery('english', $3)) DESC
+                LIMIT $4
+            """, app_name, user_id, query, self.max_results)
 
             for row in rows:
                 try:
@@ -567,7 +588,7 @@ class DatabaseMemoryService(BaseMemoryService):
             return SearchMemoryResponse()
 
         if self._is_postgresql:
-            return self._search_memory_keyword_pg(app_name, user_id, query_words)
+            return await self._search_memory_keyword_pg(app_name, user_id, query_words)
         else:
             return self._search_memory_keyword_sqlite(app_name, user_id, query_words)
 
@@ -609,23 +630,23 @@ class DatabaseMemoryService(BaseMemoryService):
 
         return response
 
-    def _search_memory_keyword_pg(
+    async def _search_memory_keyword_pg(
         self, app_name: str, user_id: str, query_words: set
     ) -> SearchMemoryResponse:
         """Keyword search in PostgreSQL."""
         response = SearchMemoryResponse()
 
-        with self._get_pg_cursor() as cursor:
-            cursor.execute("""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("""
                 SELECT e.content_json, e.author, e.timestamp, e.content_text
                 FROM memory_events e
                 JOIN memory_sessions s ON e.session_pk = s.id
-                WHERE s.app_name = %s AND s.user_id = %s
+                WHERE s.app_name = $1 AND s.user_id = $2
                 ORDER BY e.timestamp DESC
-                LIMIT %s
-            """, (app_name, user_id, self.max_results * 10))
+                LIMIT $3
+            """, app_name, user_id, self.max_results * 10)
 
-            for row in cursor.fetchall():
+            for row in rows:
                 if not row['content_text']:
                     continue
 
@@ -648,7 +669,9 @@ class DatabaseMemoryService(BaseMemoryService):
         return response
 
     def clear_memory(self, app_name: Optional[str] = None, user_id: Optional[str] = None):
-        """Clear memories from the database.
+        """Clear memories from the database (sync, SQLite only).
+
+        For PostgreSQL, use clear_memory_async().
 
         Args:
             app_name: If provided, only clear memories for this app.
@@ -656,7 +679,21 @@ class DatabaseMemoryService(BaseMemoryService):
                      Requires app_name to also be provided.
         """
         if self._is_postgresql:
-            self._clear_memory_pg(app_name, user_id)
+            raise RuntimeError("Use clear_memory_async() for PostgreSQL")
+
+        self._clear_memory_sqlite(app_name, user_id)
+        logger.info(f"Cleared memory: app={app_name}, user={user_id}")
+
+    async def clear_memory_async(self, app_name: Optional[str] = None, user_id: Optional[str] = None):
+        """Clear memories from the database (async).
+
+        Args:
+            app_name: If provided, only clear memories for this app.
+            user_id: If provided, only clear memories for this user.
+                     Requires app_name to also be provided.
+        """
+        if self._is_postgresql:
+            await self._clear_memory_pg(app_name, user_id)
         else:
             self._clear_memory_sqlite(app_name, user_id)
 
@@ -678,30 +715,43 @@ class DatabaseMemoryService(BaseMemoryService):
             else:
                 cursor.execute("DELETE FROM memory_sessions")
 
-    def _clear_memory_pg(self, app_name: Optional[str], user_id: Optional[str]):
+    async def _clear_memory_pg(self, app_name: Optional[str], user_id: Optional[str]):
         """Clear memories from PostgreSQL."""
-        with self._get_pg_cursor() as cursor:
+        async with self._pool.acquire() as conn:
             if app_name and user_id:
-                cursor.execute(
-                    "DELETE FROM memory_sessions WHERE app_name = %s AND user_id = %s",
-                    (app_name, user_id)
+                await conn.execute(
+                    "DELETE FROM memory_sessions WHERE app_name = $1 AND user_id = $2",
+                    app_name, user_id
                 )
             elif app_name:
-                cursor.execute(
-                    "DELETE FROM memory_sessions WHERE app_name = %s",
-                    (app_name,)
+                await conn.execute(
+                    "DELETE FROM memory_sessions WHERE app_name = $1",
+                    app_name
                 )
             else:
-                cursor.execute("DELETE FROM memory_sessions")
+                await conn.execute("DELETE FROM memory_sessions")
 
     def get_stats(self) -> dict:
-        """Get statistics about stored memories.
+        """Get statistics about stored memories (sync, SQLite only).
+
+        For PostgreSQL, use get_stats_async().
 
         Returns:
             Dictionary with memory statistics.
         """
         if self._is_postgresql:
-            return self._get_stats_pg()
+            raise RuntimeError("Use get_stats_async() for PostgreSQL")
+
+        return self._get_stats_sqlite()
+
+    async def get_stats_async(self) -> dict:
+        """Get statistics about stored memories (async).
+
+        Returns:
+            Dictionary with memory statistics.
+        """
+        if self._is_postgresql:
+            return await self._get_stats_pg()
         else:
             return self._get_stats_sqlite()
 
@@ -728,20 +778,13 @@ class DatabaseMemoryService(BaseMemoryService):
             "database_url": self.database_url,
         }
 
-    def _get_stats_pg(self) -> dict:
+    async def _get_stats_pg(self) -> dict:
         """Get stats from PostgreSQL."""
-        with self._get_pg_cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) as count FROM memory_sessions")
-            session_count = cursor.fetchone()['count']
-
-            cursor.execute("SELECT COUNT(*) as count FROM memory_events")
-            event_count = cursor.fetchone()['count']
-
-            cursor.execute("SELECT COUNT(DISTINCT app_name) as count FROM memory_sessions")
-            app_count = cursor.fetchone()['count']
-
-            cursor.execute("SELECT COUNT(DISTINCT user_id) as count FROM memory_sessions")
-            user_count = cursor.fetchone()['count']
+        async with self._pool.acquire() as conn:
+            session_count = await conn.fetchval("SELECT COUNT(*) FROM memory_sessions")
+            event_count = await conn.fetchval("SELECT COUNT(*) FROM memory_events")
+            app_count = await conn.fetchval("SELECT COUNT(DISTINCT app_name) FROM memory_sessions")
+            user_count = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM memory_sessions")
 
         return {
             "sessions": session_count,
