@@ -1005,3 +1005,93 @@ class DatabaseSessionService(BaseSessionService):
         session.last_update_time = event.timestamp
 
         return event
+
+    # =========================================================================
+    # Session State Update
+    # =========================================================================
+
+    async def update_session_state(
+        self,
+        *,
+        session: Session,
+        state_delta: dict[str, Any],
+    ) -> Session:
+        """
+        Update session state with a delta.
+
+        This merges the state_delta into the existing session state and
+        persists it to the database. Useful for injecting auth info or
+        other transient state before running agents.
+
+        Args:
+            session: The session to update
+            state_delta: Dict of state keys to update/add
+
+        Returns:
+            The updated Session object
+        """
+        if self._is_postgres:
+            return await self._update_session_state_pg(session, state_delta)
+        else:
+            return self._update_session_state_sqlite(session, state_delta)
+
+    def _update_session_state_sqlite(
+        self,
+        session: Session,
+        state_delta: dict[str, Any],
+    ) -> Session:
+        """Update session state in SQLite."""
+        with self._get_sqlite_cursor() as cursor:
+            # Get current state
+            cursor.execute("""
+                SELECT state FROM sessions
+                WHERE app_name = ? AND user_id = ? AND session_id = ?
+            """, (session.app_name, session.user_id, session.id))
+
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError(f"Session {session.id} not found")
+
+            current_state = self._deserialize_json(row[0])
+            current_state.update(state_delta)
+
+            # Update in database
+            state_json = self._serialize_json(current_state)
+            cursor.execute("""
+                UPDATE sessions SET state = ?
+                WHERE app_name = ? AND user_id = ? AND session_id = ?
+            """, (state_json, session.app_name, session.user_id, session.id))
+
+        # Update in-memory session
+        session.state.update(state_delta)
+        return session
+
+    async def _update_session_state_pg(
+        self,
+        session: Session,
+        state_delta: dict[str, Any],
+    ) -> Session:
+        """Update session state in PostgreSQL."""
+        async with self._pool.acquire() as conn:
+            # Get current state
+            row = await conn.fetchrow("""
+                SELECT state FROM sessions
+                WHERE app_name = $1 AND user_id = $2 AND session_id = $3
+            """, session.app_name, session.user_id, session.id)
+
+            if not row:
+                raise ValueError(f"Session {session.id} not found")
+
+            current_state = self._deserialize_json(row["state"])
+            current_state.update(state_delta)
+
+            # Update in database
+            state_json = self._serialize_json(current_state)
+            await conn.execute("""
+                UPDATE sessions SET state = $1
+                WHERE app_name = $2 AND user_id = $3 AND session_id = $4
+            """, state_json, session.app_name, session.user_id, session.id)
+
+        # Update in-memory session
+        session.state.update(state_delta)
+        return session

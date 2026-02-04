@@ -39,19 +39,91 @@ class AuthorizationPlugin(BasePlugin):
     Example:
         from authorization import AuthorizationPlugin, StaticPIP, Policy, PolicyRule
 
-        # Define policies
+        # Define policies for agents and tools
         policies = {
+            # Agent policy: only admins can access admin_agent
             "agent:admin_agent": Policy(
                 resource_type="agent",
                 resource_name="admin_agent",
                 rules=[PolicyRule(type="rbac", required_roles=["admin"])]
             ),
+
+            # Tool policy: only admins can use delete_user tool
+            "tool:delete_user": Policy(
+                resource_type="tool",
+                resource_name="delete_user",
+                rules=[PolicyRule(type="rbac", required_roles=["admin"])]
+            ),
+
+            # Tool policy with multiple roles (any role grants access)
+            "tool:view_reports": Policy(
+                resource_type="tool",
+                resource_name="view_reports",
+                rules=[PolicyRule(
+                    type="rbac",
+                    required_roles=["admin", "analyst", "manager"],
+                    match="any"  # User needs ANY of these roles
+                )]
+            ),
+
+            # Tool policy requiring ALL roles
+            "tool:approve_budget": Policy(
+                resource_type="tool",
+                resource_name="approve_budget",
+                rules=[PolicyRule(
+                    type="rbac",
+                    required_roles=["manager", "finance"],
+                    match="all"  # User needs ALL of these roles
+                )]
+            ),
+
+            # Tool policy with ABAC (attribute-based access control)
+            "tool:access_confidential": Policy(
+                resource_type="tool",
+                resource_name="access_confidential",
+                rules=[PolicyRule(
+                    type="abac",
+                    conditions={
+                        "department": "legal",      # User must be in legal dept
+                        "clearance_level": "high",  # User must have high clearance
+                    }
+                )]
+            ),
+
+            # Tool policy combining RBAC and ABAC
+            "tool:transfer_funds": Policy(
+                resource_type="tool",
+                resource_name="transfer_funds",
+                rules=[
+                    # Rule 1: Admins can always transfer
+                    PolicyRule(type="rbac", required_roles=["admin"]),
+                    # Rule 2: Finance managers can transfer (if first rule fails)
+                    PolicyRule(
+                        type="rbac",
+                        required_roles=["manager"],
+                        conditions={"department": "finance"}
+                    ),
+                ]
+            ),
         }
 
-        # Define users
+        # Define users with roles and attributes
         users = {
-            "alice": UserContext(user_id="alice", roles={"analyst"}),
-            "bob": UserContext(user_id="bob", roles={"admin"}),
+            "alice": UserContext(
+                user_id="alice",
+                roles={"analyst"},
+                attributes={"department": "research"}
+            ),
+            "bob": UserContext(
+                user_id="bob",
+                roles={"admin"},
+                attributes={"department": "it"}
+            ),
+            "carol": UserContext(
+                user_id="carol",
+                roles={"manager", "finance"},
+                attributes={"department": "finance", "clearance_level": "high"}
+            ),
         }
 
         # Create PIP and plugin
@@ -60,6 +132,9 @@ class AuthorizationPlugin(BasePlugin):
 
         # Add to runner
         runner = Runner(app=my_app, plugins=[auth_plugin])
+
+        # With default_allow=False, tools without policies are denied
+        auth_plugin_strict = AuthorizationPlugin(pip=pip, default_allow=False)
     """
 
     def __init__(
@@ -102,7 +177,7 @@ class AuthorizationPlugin(BasePlugin):
         """
         # Read auth info from session (set by middleware or caller)
         auth_info = invocation_context.session.state.get("_auth", {})
-
+        logging.debug(f"AuthorizationPlugin: auth_info={auth_info}")
         if not auth_info.get("is_authenticated"):
             if self.require_auth:
                 return self._error("Authentication required")
@@ -143,7 +218,7 @@ class AuthorizationPlugin(BasePlugin):
         """
         invocation_context = callback_context._invocation_context
         user = self._get_user_context(invocation_context)
-
+        logging.debug(f"Authorizing user '{user if user else 'unknown'}' for agent '{agent.name}'")
         if not user:
             return self._error("Not authenticated")
 
@@ -171,7 +246,7 @@ class AuthorizationPlugin(BasePlugin):
         self,
         *,
         tool: BaseTool,
-        _tool_args: Dict[str, Any],
+        tool_args: Dict[str, Any],
         tool_context: ToolContext,
     ) -> Optional[Dict]:
         """

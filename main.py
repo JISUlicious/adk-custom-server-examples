@@ -41,10 +41,15 @@ import logging
 import os
 
 from dotenv import load_dotenv
+from google.adk.artifacts.file_artifact_service import FileArtifactService
+
+from authorization.pip import StaticPIP
+from authorization.plugin import AuthorizationPlugin
 
 # Load environment variables from .env file
 load_dotenv()
 
+from authorization.models import Policy, PolicyRule, UserContext
 from custom_web_server import (
     CustomWebServer,
     ServerConfig,
@@ -134,10 +139,10 @@ Environment variables (set in .env or shell):
         help="Memory database URL (env: MEMORY_DB_URL, default: sqlite:///memory.db)",
     )
     parser.add_argument(
-        "--no-web-ui",
+        "--web-ui",
         action="store_true",
-        default=not get_env_bool("WEB_UI_ENABLED", False),
-        help="Disable ADK Web UI (env: WEB_UI_ENABLED=false)",
+        default=get_env_bool("WEB_UI_ENABLED", True),
+        help="Enable ADK Web UI (env: WEB_UI_ENABLED=true)",
     )
     parser.add_argument(
         "--reload",
@@ -154,7 +159,7 @@ Environment variables (set in .env or shell):
     return parser.parse_args()
 
 
-def create_plugins():
+def create_authorization_plugins():
     """
     Create plugins for the runner factory.
 
@@ -174,7 +179,32 @@ def create_plugins():
         pip = StaticPIP(policies=policies)
         return [AuthorizationPlugin(pip=pip)]
     """
-    return []  # No plugins by default
+    policies = {
+        "agent:weather_agent": Policy(
+            resource_type="agent",
+            resource_name="weather_agent",
+            rules=[PolicyRule(type="rbac", required_roles=["weather_forecaster"])],
+        ),
+        "tool:get_users_list": Policy(
+            resource_type="tool",
+            resource_name="get_users_list",
+            rules=[PolicyRule(type="rbac", required_roles=["admin"])],
+        ),
+    }
+    users = {
+        "default_user": UserContext(
+            user_id="default_user",
+            roles={"admin"},
+            attributes={"department": "research"},
+        ),
+        "test_user": UserContext(
+            user_id="test_user",
+            roles={"weather_forecaster"},
+            attributes={"department": "engineering"},
+        ),
+    }
+    pip = StaticPIP(policies=policies, users=users)
+    return [AuthorizationPlugin(pip=pip)]
 
 
 def main():
@@ -192,15 +222,17 @@ def main():
     # Create services
     session_service = DatabaseSessionService(args.session_db)
     memory_service = DatabaseMemoryService(args.memory_db)
+    artifact_service = FileArtifactService(root_dir="./artifacts")
 
     # Create service container
     services = ServiceContainer(
         session_service=session_service,
         memory_service=memory_service,
+        artifact_service=artifact_service,
     )
 
     # Create plugins (customize in create_plugins function)
-    plugins = create_plugins()
+    plugins = create_authorization_plugins()
     if plugins:
         logger.info("  Plugins: %d", len(plugins))
 
@@ -215,7 +247,7 @@ def main():
     config = ServerConfig(
         host=args.host,
         port=args.port,
-        web_ui_enabled=not args.no_web_ui,
+        web_ui_enabled=args.web_ui,
         reload=args.reload,
         log_level=args.log_level,
     )
