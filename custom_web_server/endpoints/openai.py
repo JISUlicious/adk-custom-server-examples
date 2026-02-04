@@ -11,12 +11,13 @@ import json
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from google.adk.agents.run_config import RunConfig, StreamingMode
 
+from ..auth import get_auth_info
 from ..converters import OpenAIConverter
 from ..models import (
     OpenAIChatCompletionRequest,
@@ -69,7 +70,10 @@ def create_openai_router(server: "CustomWebServer") -> APIRouter:
         )
 
     @router.post("/chat/completions", response_model=None)
-    async def chat_completions(request: OpenAIChatCompletionRequest):
+    async def chat_completions(
+        request: OpenAIChatCompletionRequest,
+        auth_info: Dict[str, Any] = Depends(get_auth_info),
+    ):
         """
         OpenAI-compatible chat completion endpoint.
 
@@ -99,6 +103,18 @@ def create_openai_router(server: "CustomWebServer") -> APIRouter:
                 user_id=user_id,
                 session_id=request.effective_session_id,
             )
+
+            # Inject auth info into session state
+            session = await server.session_service.get_session(
+                app_name=app_name,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            if session:
+                await server.session_service.update_session_state(
+                    session=session,
+                    state_delta={"_auth": auth_info},
+                )
 
             # Convert messages to ADK format
             new_message = OpenAIConverter.messages_to_adk_content(request.messages)

@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -184,6 +184,29 @@ class CustomWebServer:
             allow_methods=["*"],
             allow_headers=["*"],
         )
+
+        # Add authentication header logging middleware
+        @app.middleware("http")
+        async def log_auth_headers(request, call_next):
+            """Log authentication headers for debugging."""
+            user_id = request.headers.get("X-User-Id")
+            roles = request.headers.get("X-User-Roles")
+            attrs = request.headers.get("X-User-Attributes")
+            auth_header = request.headers.get("Authorization")
+
+            # Log auth headers for every request
+            logger.info(
+                "Request %s %s - user_id=%s, roles=%s, attrs=%s, jwt=%s",
+                request.method,
+                request.url.path,
+                user_id or "none",
+                roles or "none",
+                attrs or "none",
+                "present" if auth_header else "none"
+            )
+
+            response = await call_next(request)
+            return response
 
         # Add routers
         app.include_router(create_health_router())

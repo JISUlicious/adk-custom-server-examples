@@ -53,7 +53,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import Header, HTTPException, Request
 
 logger = logging.getLogger(__name__)
-
+logger.setLevel(logging.DEBUG)
 
 # =============================================================================
 # JWT Configuration
@@ -334,13 +334,9 @@ def get_auth_info(
 
     If no JWT config is set, falls back to dev mode behavior (header-based).
     """
+    logger.debug(f">>>>>>>>{x_user_attributes=}, {x_user_id=}, {x_user_roles=}, {authorization=}")
     # Use configured JWT validator if available
     if _jwt_validator and _jwt_config:
-        if authorization and authorization.startswith("Bearer "):
-            token = authorization[7:]
-            payload = _jwt_validator.validate(token)
-            return _jwt_validator.extract_auth_info(payload)
-
         # Dev mode fallback
         if _jwt_config.dev_mode and x_user_id:
             logger.warning(
@@ -360,6 +356,11 @@ def get_auth_info(
                 "attributes": attributes,
                 "_dev_mode": True,
             }
+
+        if authorization and authorization.startswith("Bearer "):
+            token = authorization[7:]
+            payload = _jwt_validator.validate(token)
+            return _jwt_validator.extract_auth_info(payload)
 
         return {
             "is_authenticated": False,
