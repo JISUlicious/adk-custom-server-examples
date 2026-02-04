@@ -183,7 +183,7 @@ def create_authorization_plugins():
         "agent:weather_agent": Policy(
             resource_type="agent",
             resource_name="weather_agent",
-            rules=[PolicyRule(type="rbac", required_roles=["weather_forecaster"])],
+            rules=[PolicyRule(type="rbac", required_roles=["admin","weather_forecaster"])],
         ),
         "tool:get_users_list": Policy(
             resource_type="tool",
@@ -204,7 +204,8 @@ def create_authorization_plugins():
         ),
     }
     pip = StaticPIP(policies=policies, users=users)
-    return [AuthorizationPlugin(pip=pip)]
+    # return [AuthorizationPlugin(pip=pip)]
+    return []
 
 
 def main():
@@ -250,6 +251,7 @@ def main():
         web_ui_enabled=args.web_ui,
         reload=args.reload,
         log_level=args.log_level,
+        # additional jwt settings can be set here
     )
 
     # Create and run server
