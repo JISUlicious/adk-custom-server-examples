@@ -142,6 +142,7 @@ def create_openai_router(server: "CustomWebServer") -> APIRouter:
                 )
 
         except ValueError as e:
+            logger.error("ValueError in chat completion: %s", e, exc_info=True)
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             logger.exception("Error in chat completion: %s", e)
