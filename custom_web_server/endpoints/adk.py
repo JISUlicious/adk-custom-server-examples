@@ -12,10 +12,12 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from google.genai import types
 from pydantic import BaseModel, Field
+
+from ..auth import get_auth_info
 
 if TYPE_CHECKING:
     from ..server import CustomWebServer
@@ -258,14 +260,61 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
     # -------------------------------------------------------------------------
 
     @router.post("/run")
-    async def run_agent(request: RunRequest):
+    async def run_agent(
+        request: RunRequest,
+        auth_info: dict = Depends(get_auth_info),
+    ):
         """
         Run an agent (non-streaming).
 
         Returns all events after completion.
+
+        Authorization:
+            The AuthorizationPlugin evaluates policies using RBAC and/or ABAC:
+
+            Headers:
+            - Authorization: Bearer <token> (for JWT-based auth)
+            - X-User-Id: User identifier
+            - X-User-Roles: Comma-separated roles for RBAC (e.g., "admin,analyst")
+            - X-User-Attributes: JSON for ABAC (e.g., '{"department":"finance"}')
+
+            RBAC Example (role-based):
+                X-User-Id: alice
+                X-User-Roles: admin,analyst
+
+            ABAC Example (attribute-based):
+                X-User-Id: bob
+                X-User-Attributes: {"department":"finance","clearance":"high"}
+
+            Combined:
+                X-User-Id: carol
+                X-User-Roles: manager
+                X-User-Attributes: {"department":"finance"}
         """
         try:
             runner = await server.get_runner(request.app_name)
+
+            # Ensure session exists and inject auth into session state
+            session = await server.session_service.get_session(
+                app_name=request.app_name,
+                user_id=request.user_id,
+                session_id=request.session_id,
+            )
+            if not session:
+                # Create session with auth info in initial state
+                session = await server.session_service.create_session(
+                    app_name=request.app_name,
+                    user_id=request.user_id,
+                    session_id=request.session_id,
+                    state={"_auth": auth_info},
+                )
+            else:
+                # Update existing session with auth info
+                # This persists to DB so the runner sees it when it fetches the session
+                await server.session_service.update_session_state(
+                    session=session,
+                    state_delta={"_auth": auth_info},
+                )
 
             # Convert message to ADK Content
             new_message = types.Content(
@@ -292,12 +341,60 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
             raise HTTPException(status_code=500, detail=str(e))
 
     @router.post("/run_sse")
-    async def run_agent_sse(request: RunRequest):
+    async def run_agent_sse(
+        request: RunRequest,
+        auth_info: dict = Depends(get_auth_info),
+    ):
         """
         Run an agent with Server-Sent Events streaming.
+
+        Returns events as SSE stream, ending with [DONE].
+
+        Authorization:
+            The AuthorizationPlugin evaluates policies using RBAC and/or ABAC:
+
+            Headers:
+            - Authorization: Bearer <token> (for JWT-based auth)
+            - X-User-Id: User identifier
+            - X-User-Roles: Comma-separated roles for RBAC (e.g., "admin,analyst")
+            - X-User-Attributes: JSON for ABAC (e.g., '{"department":"finance"}')
+
+            RBAC Example (role-based):
+                X-User-Id: alice
+                X-User-Roles: admin,analyst
+
+            ABAC Example (attribute-based):
+                X-User-Id: bob
+                X-User-Attributes: {"department":"finance","clearance":"high"}
+
+            Combined:
+                X-User-Id: carol
+                X-User-Roles: manager
+                X-User-Attributes: {"department":"finance"}
         """
         try:
             runner = await server.get_runner(request.app_name)
+
+            # Ensure session exists and inject auth into session state
+            session = await server.session_service.get_session(
+                app_name=request.app_name,
+                user_id=request.user_id,
+                session_id=request.session_id,
+            )
+            if not session:
+                # Create session with auth info in initial state
+                session = await server.session_service.create_session(
+                    app_name=request.app_name,
+                    user_id=request.user_id,
+                    session_id=request.session_id,
+                    state={"_auth": auth_info},
+                )
+            else:
+                # Update existing session with auth info
+                await server.session_service.update_session_state(
+                    session=session,
+                    state_delta={"_auth": auth_info},
+                )
 
             # Convert message to ADK Content
             new_message = types.Content(
@@ -346,6 +443,61 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
         - user_id: str
         - session_id: str
         - message: dict (ADK Content format)
+        - auth: dict (optional) - Authorization info for RBAC/ABAC
+
+        Authorization:
+            Unlike HTTP endpoints, WebSocket auth is passed in each message payload
+            since headers are only available at connection time.
+
+            The AuthorizationPlugin evaluates policies using RBAC and/or ABAC:
+
+            auth object structure:
+            {
+                "is_authenticated": true,
+                "user_id": "alice",
+                "roles": ["admin", "analyst"],       // For RBAC
+                "attributes": {"department": "finance"}  // For ABAC
+            }
+
+            RBAC Example (role-based):
+            {
+                "app_name": "my_app",
+                "user_id": "alice",
+                "session_id": "sess_123",
+                "message": {"role": "user", "parts": [{"text": "Hello"}]},
+                "auth": {
+                    "is_authenticated": true,
+                    "user_id": "alice",
+                    "roles": ["admin", "analyst"]
+                }
+            }
+
+            ABAC Example (attribute-based):
+            {
+                "app_name": "my_app",
+                "user_id": "bob",
+                "session_id": "sess_456",
+                "message": {"role": "user", "parts": [{"text": "Hello"}]},
+                "auth": {
+                    "is_authenticated": true,
+                    "user_id": "bob",
+                    "attributes": {"department": "finance", "clearance": "high"}
+                }
+            }
+
+            Combined RBAC + ABAC:
+            {
+                "app_name": "my_app",
+                "user_id": "carol",
+                "session_id": "sess_789",
+                "message": {"role": "user", "parts": [{"text": "Hello"}]},
+                "auth": {
+                    "is_authenticated": true,
+                    "user_id": "carol",
+                    "roles": ["manager"],
+                    "attributes": {"department": "finance"}
+                }
+            }
         """
         await websocket.accept()
 
@@ -359,6 +511,14 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
                 session_id = data.get("session_id")
                 message_data = data.get("message", {})
 
+                # Get auth info from message (for WebSocket, client sends auth in each message)
+                auth_info = data.get("auth", {
+                    "is_authenticated": False,
+                    "user_id": user_id,
+                    "roles": [],
+                    "attributes": {},
+                })
+
                 if not all([app_name, user_id, session_id]):
                     await websocket.send_json({
                         "error": "Missing required fields: app_name, user_id, session_id"
@@ -367,6 +527,25 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
 
                 try:
                     runner = await server.get_runner(app_name)
+
+                    # Ensure session exists and inject auth
+                    session = await server.session_service.get_session(
+                        app_name=app_name,
+                        user_id=user_id,
+                        session_id=session_id,
+                    )
+                    if not session:
+                        session = await server.session_service.create_session(
+                            app_name=app_name,
+                            user_id=user_id,
+                            session_id=session_id,
+                            state={"_auth": auth_info},
+                        )
+                    else:
+                        await server.session_service.update_session_state(
+                            session=session,
+                            state_delta={"_auth": auth_info},
+                        )
 
                     new_message = types.Content(
                         role=message_data.get("role", "user"),

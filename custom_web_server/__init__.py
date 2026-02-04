@@ -13,6 +13,15 @@ from .config import ServerConfig
 from .server import CustomWebServer, create_server
 from .services import ServiceContainer
 from .factory import RunnerFactory, DefaultRunnerFactory, StaticRunnerFactory
+from .auth import (
+    JWTConfig,
+    JWTValidator,
+    get_auth_info,
+    create_jwt_auth_dependency,
+    create_role_checker,
+    create_attribute_checker,
+    generate_test_token,
+)
 
 __all__ = [
     # Core
@@ -24,6 +33,14 @@ __all__ = [
     "RunnerFactory",
     "DefaultRunnerFactory",
     "StaticRunnerFactory",
+    # Auth (JWT)
+    "JWTConfig",
+    "JWTValidator",
+    "get_auth_info",
+    "create_jwt_auth_dependency",
+    "create_role_checker",
+    "create_attribute_checker",
+    "generate_test_token",
     # Convenience
     "create_server",
 ]

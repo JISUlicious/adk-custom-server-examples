@@ -21,7 +21,7 @@ Architecture:
     └─────────────────────────────────────────────────────────────┘
 
 Quick Start:
-    from authorization import (
+    from authorization import (ß
         SimpleAuthorizationPlugin,
         StaticPIP,
         Policy,
