@@ -99,6 +99,7 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
     # -------------------------------------------------------------------------
 
     @router.get("/list-apps")
+    @router.get("/list_apps")
     async def list_apps() -> List[str]:
         """List available ADK apps."""
         return server.list_apps()
@@ -341,6 +342,7 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
             raise HTTPException(status_code=500, detail=str(e))
 
     @router.post("/run_sse")
+    @router.post("/run-sse")
     async def run_agent_sse(
         request: RunRequest,
         auth_info: dict = Depends(get_auth_info),
@@ -413,9 +415,35 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
                         session_id=request.session_id,
                         new_message=new_message,
                     ):
-                        data = json.dumps(_serialize_event(event))
-                        yield f"data: {data}\n\n"
-                    yield "data: [DONE]\n\n"
+                        # Handle artifact_delta splitting like official ADK server
+                        # This ensures proper rendering in ADK Web UI
+                        events_to_stream = [event]
+                        if (
+                            hasattr(event, "actions") and
+                            hasattr(event.actions, "artifact_delta") and
+                            event.actions.artifact_delta and
+                            hasattr(event, "content") and
+                            event.content and
+                            hasattr(event.content, "parts") and
+                            event.content.parts
+                        ):
+                            # Split into content event and artifact event
+                            content_event = event.model_copy(deep=True)
+                            content_event.actions.artifact_delta = {}
+                            artifact_event = event.model_copy(deep=True)
+                            artifact_event.content = None
+                            events_to_stream = [content_event, artifact_event]
+
+                        for event_to_stream in events_to_stream:
+                            # Use model_dump_json for proper serialization (matches official ADK)
+                            if hasattr(event_to_stream, "model_dump_json"):
+                                data = event_to_stream.model_dump_json(
+                                    exclude_none=True,
+                                    by_alias=True,
+                                )
+                            else:
+                                data = json.dumps(_serialize_event(event_to_stream))
+                            yield f"data: {data}\n\n"
                 except Exception as e:
                     logger.exception("Error in SSE stream: %s", e)
                     yield f"data: {json.dumps({'error': str(e)})}\n\n"
@@ -434,6 +462,7 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
             raise HTTPException(status_code=500, detail=str(e))
 
     @router.websocket("/run_live")
+    @router.websocket("/run-live")
     async def run_live(websocket: WebSocket):
         """
         WebSocket endpoint for live agent interaction.
@@ -710,8 +739,9 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
     # -------------------------------------------------------------------------
     # Evaluation
     # -------------------------------------------------------------------------
-
+    # Evaluation endpoints are not stable and may change in future.
     @router.post("/apps/{app_name}/eval-sets")
+    @router.post("/apps/{app_name}/eval_sets")
     async def create_eval_set(app_name: str, request: CreateEvalSetRequest):
         """Create an evaluation set."""
         if not server.eval_sets_manager:
@@ -724,6 +754,7 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
         return {"eval_set_id": request.eval_set_id}
 
     @router.get("/apps/{app_name}/eval-sets")
+    @router.get("/apps/{app_name}/eval_sets")
     async def list_eval_sets(app_name: str):
         """List evaluation sets."""
         if not server.eval_sets_manager:
@@ -733,6 +764,7 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
         return {"eval_sets": eval_sets}
 
     @router.get("/apps/{app_name}/eval-sets/{eval_set_id}")
+    @router.get("/apps/{app_name}/eval_sets/{eval_set_id}")
     async def get_eval_set(app_name: str, eval_set_id: str):
         """Get an evaluation set."""
         if not server.eval_sets_manager:
@@ -747,6 +779,7 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
         return eval_set
 
     @router.post("/apps/{app_name}/eval-sets/{eval_set_id}/add-session")
+    @router.post("/apps/{app_name}/eval_sets/{eval_set_id}/add_session")
     async def add_session_to_eval(
         app_name: str,
         eval_set_id: str,
@@ -764,6 +797,7 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
         return {"added": True}
 
     @router.post("/apps/{app_name}/eval-sets/{eval_set_id}/run")
+    @router.post("/apps/{app_name}/eval_sets/{eval_set_id}/run_eval")
     async def run_eval(
         app_name: str,
         eval_set_id: str,
@@ -782,6 +816,7 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
         }
 
     @router.get("/apps/{app_name}/eval-results")
+    @router.get("/apps/{app_name}/eval_results")
     async def list_eval_results(app_name: str):
         """List evaluation results."""
         if not server.eval_set_results_manager:
@@ -800,7 +835,17 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
 # =============================================================================
 
 def _serialize_event(event: Any) -> Dict[str, Any]:
-    """Serialize an ADK event to JSON-compatible dict."""
+    """Serialize an ADK event to JSON-compatible dict.
+
+    Uses Pydantic's model_dump if available for proper serialization,
+    including thinking/reasoning content with the 'thought' field.
+    Falls back to manual serialization for non-Pydantic objects.
+    """
+    # Prefer Pydantic's built-in serialization (matches official ADK server)
+    if hasattr(event, "model_dump"):
+        return event.model_dump(exclude_none=True, by_alias=True)
+
+    # Fallback for non-Pydantic objects
     result = {
         "id": getattr(event, "id", None),
         "author": getattr(event, "author", None),
@@ -815,19 +860,22 @@ def _serialize_event(event: Any) -> Dict[str, Any]:
         if content.parts:
             for part in content.parts:
                 part_data = {}
+                # Include thought field for thinking/reasoning content
+                if hasattr(part, "thought") and part.thought is not None:
+                    part_data["thought"] = part.thought
                 if hasattr(part, "text") and part.text:
                     part_data["text"] = part.text
                 if hasattr(part, "function_call") and part.function_call:
                     fc = part.function_call
-                    part_data["function_call"] = {
+                    part_data["functionCall"] = {
                         "name": fc.name,
-                        "args": fc.args,
+                        "args": fc.args if hasattr(fc, "args") else {},
                     }
                 if hasattr(part, "function_response") and part.function_response:
                     fr = part.function_response
-                    part_data["function_response"] = {
+                    part_data["functionResponse"] = {
                         "name": fr.name,
-                        "response": fr.response,
+                        "response": fr.response if hasattr(fr, "response") else {},
                     }
                 if part_data:
                     result["content"]["parts"].append(part_data)
