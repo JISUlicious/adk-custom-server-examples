@@ -5,7 +5,7 @@ Groups all services for cleaner dependency injection.
 """
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 from google.adk.sessions.base_session_service import BaseSessionService
 from google.adk.memory.base_memory_service import BaseMemoryService
@@ -26,8 +26,6 @@ class ServiceContainer:
         memory_service: Memory service for RAG (optional)
         artifact_service: Artifact storage service (optional)
         credential_service: Credential management service (optional)
-        eval_sets_manager: Evaluation sets manager (optional)
-        eval_set_results_manager: Evaluation results manager (optional)
 
     Example:
         from google.adk.sessions.in_memory_session_service import InMemorySessionService
@@ -43,5 +41,3 @@ class ServiceContainer:
     memory_service: Optional[BaseMemoryService] = None
     artifact_service: Optional[BaseArtifactService] = None
     credential_service: Optional[BaseCredentialService] = None
-    eval_sets_manager: Optional[Any] = None
-    eval_set_results_manager: Optional[Any] = None

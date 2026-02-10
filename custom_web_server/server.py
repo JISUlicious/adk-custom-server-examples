@@ -109,8 +109,6 @@ class CustomWebServer:
         self.session_service = services.session_service
         self.memory_service = services.memory_service
         self.artifact_service = services.artifact_service
-        self.eval_sets_manager = services.eval_sets_manager
-        self.eval_set_results_manager = services.eval_set_results_manager
 
         self.default_app_name = default_app_name
         self.config = config or ServerConfig()
@@ -284,7 +282,7 @@ class CustomWebServer:
             import google.adk.cli
 
             adk_cli_path = Path(google.adk.cli.__file__).parent
-            web_assets_path = adk_cli_path / "browser" / "dist"
+            web_assets_path = adk_cli_path / "browser"
 
             if web_assets_path.exists():
                 app.mount(

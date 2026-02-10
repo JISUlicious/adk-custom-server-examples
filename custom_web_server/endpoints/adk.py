@@ -5,14 +5,15 @@ Provides:
 - Session management
 - Agent execution (run, run_sse, run_live)
 - Artifact management
-- Evaluation management
+
+Matches the official Google ADK server API (adk_web_server.py).
 """
 
 import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from google.genai import types
 from pydantic import BaseModel, Field
@@ -26,49 +27,43 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Request/Response Models
+# Request/Response Models (matching official ADK server)
 # =============================================================================
 
 class CreateSessionRequest(BaseModel):
     """Request to create a new session."""
-    session_id: Optional[str] = None
-    state: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = Field(
+        default=None,
+        description="The ID of the session to create. If not provided, a random ID will be generated."
+    )
+    state: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="The initial state of the session."
+    )
+    # Note: Official also supports 'events' field for initializing with events
 
 
-class UpdateSessionStateRequest(BaseModel):
-    """Request to update session state."""
-    state: Dict[str, Any]
+class UpdateSessionRequest(BaseModel):
+    """Request to update session state without running the agent."""
+    state_delta: Dict[str, Any]
 
 
-class RunRequest(BaseModel):
-    """Request to run an agent."""
+class RunAgentRequest(BaseModel):
+    """Request to run an agent (matches official ADK RunAgentRequest)."""
+    model_config = {"populate_by_name": True}
+
     app_name: str = Field(alias="appName")
     user_id: str = Field(alias="userId")
     session_id: str = Field(alias="sessionId")
-    new_message: Dict[str, Any]
+    new_message: Dict[str, Any] = Field(alias="newMessage")  # Will be converted to types.Content
     streaming: bool = False
+    state_delta: Optional[Dict[str, Any]] = Field(default=None, alias="stateDelta")
+    invocation_id: Optional[str] = Field(default=None, alias="invocationId")  # For resume long running functions
 
-    model_config = {"populate_by_name": True}  # Accept both snake_case and camelCase
 
-
-class AddSessionToMemoryRequest(BaseModel):
-    """Request to add session to memory."""
+class UpdateMemoryRequest(BaseModel):
+    """Request to add a session to the memory service."""
     session_id: str
-
-
-class CreateEvalSetRequest(BaseModel):
-    """Request to create an eval set."""
-    eval_set_id: str
-
-
-class AddSessionToEvalRequest(BaseModel):
-    """Request to add session to eval set."""
-    session_id: str
-
-
-class RunEvalRequest(BaseModel):
-    """Request to run evaluation."""
-    eval_metrics: Optional[List[str]] = None
 
 
 class SaveArtifactRequest(BaseModel):
@@ -99,26 +94,34 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
     # -------------------------------------------------------------------------
 
     @router.get("/list-apps")
-    async def list_apps() -> List[str]:
-        """List available ADK apps."""
-        return server.list_apps()
+    async def list_apps(
+        detailed: bool = Query(
+            default=False, description="Return detailed app information"
+        )
+    ):
+        """List available ADK apps (matches official ADK server)."""
+        apps = server.list_apps()
+        if detailed:
+            # Return detailed app info if supported by runner factory
+            return {"apps": [{"name": app} for app in apps]}
+        return apps
 
     # -------------------------------------------------------------------------
     # Session Management
     # -------------------------------------------------------------------------
 
-    @router.post("/apps/{app_name}/users/{user_id}/sessions")
+    @router.post(
+        "/apps/{app_name}/users/{user_id}/sessions",
+        response_model_exclude_none=True,
+    )
     async def create_session(
         app_name: str,
         user_id: str,
         request: Optional[CreateSessionRequest] = None,
     ):
-        """Create a new session.
+        """Create a new session (matches official ADK server)."""
+        from google.adk.errors.already_exists_error import AlreadyExistsError
 
-        Optionally accepts a session_id in the request body to create
-        a session with a specific ID. If not provided, a random ID
-        will be generated.
-        """
         state = request.state if request else None
         session_id = request.session_id if request else None
 
@@ -126,81 +129,74 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
             session = await server.session_service.create_session(
                 app_name=app_name,
                 user_id=user_id,
-                state=state or {},
+                state=state,
                 session_id=session_id,
             )
+            logger.info("New session created: %s", session.id)
+            return session
+        except AlreadyExistsError as e:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Session already exists: {session_id}"
+            ) from e
         except Exception as e:
-            # Handle AlreadyExistsError or similar
-            if "already exists" in str(e).lower():
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Session already exists: {session_id}"
-                )
-            raise HTTPException(status_code=500, detail=str(e))
+            logger.error("Internal server error during session creation: %s", e, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
-        return {
-            "id": session.id,
-            "app_name": session.app_name,
-            "user_id": session.user_id,
-            "state": session.state,
-        }
-
-    @router.post("/apps/{app_name}/users/{user_id}/sessions/{session_id}")
+    @router.post(
+        "/apps/{app_name}/users/{user_id}/sessions/{session_id}",
+        response_model_exclude_none=True,
+    )
     async def create_session_with_id(
         app_name: str,
         user_id: str,
         session_id: str,
         state: Optional[Dict[str, Any]] = None,
     ):
-        """Create a new session with a specific session ID.
+        """Create a new session with a specific session ID (deprecated in official ADK)."""
+        from google.adk.errors.already_exists_error import AlreadyExistsError
 
-        This endpoint allows creating a session with an explicit session_id
-        provided in the URL path.
-        """
         try:
             session = await server.session_service.create_session(
                 app_name=app_name,
                 user_id=user_id,
-                state=state or {},
+                state=state,
                 session_id=session_id,
             )
+            logger.info("New session created: %s", session.id)
+            return session
+        except AlreadyExistsError as e:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Session already exists: {session_id}"
+            ) from e
         except Exception as e:
-            # Handle AlreadyExistsError or similar
-            if "already exists" in str(e).lower():
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Session already exists: {session_id}"
-                )
-            raise HTTPException(status_code=500, detail=str(e))
+            logger.error("Internal server error during session creation: %s", e, exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
-        return {
-            "id": session.id,
-            "app_name": session.app_name,
-            "user_id": session.user_id,
-            "state": session.state,
-        }
-
-    @router.get("/apps/{app_name}/users/{user_id}/sessions")
+    @router.get(
+        "/apps/{app_name}/users/{user_id}/sessions",
+        response_model_exclude_none=True,
+    )
     async def list_sessions(app_name: str, user_id: str):
-        """List sessions for a user."""
-        response = await server.session_service.list_sessions(
+        """List sessions for a user (returns Session objects like official ADK)."""
+        list_sessions_response = await server.session_service.list_sessions(
             app_name=app_name,
             user_id=user_id,
         )
-        return {
-            "sessions": [
-                {
-                    "id": s.id,
-                    "app_name": s.app_name,
-                    "user_id": s.user_id,
-                }
-                for s in response.sessions
-            ]
-        }
+        # Return sessions directly, filtering out eval sessions
+        return [
+            session
+            for session in list_sessions_response.sessions
+            if not session.id.startswith("eval_")  # Filter eval sessions like official ADK
+        ]
 
-    @router.get("/apps/{app_name}/users/{user_id}/sessions/{session_id}")
+    @router.get(
+        "/apps/{app_name}/users/{user_id}/sessions/{session_id}",
+        response_model_exclude_none=True,
+    )
     async def get_session(app_name: str, user_id: str, session_id: str):
-        """Get a specific session."""
+        """Get a specific session (returns Session object like official ADK)."""
         session = await server.session_service.get_session(
             app_name=app_name,
             user_id=user_id,
@@ -208,27 +204,15 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
         )
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
-        return {
-            "id": session.id,
-            "app_name": session.app_name,
-            "user_id": session.user_id,
-            "state": session.state,
-            "events": [
-                {
-                    "id": e.id,
-                    "author": e.author,
-                    "timestamp": e.timestamp.isoformat() if e.timestamp else None,
-                }
-                for e in session.events
-            ] if session.events else [],
-        }
+        # Return the Session object directly - FastAPI handles serialization
+        return session
 
     @router.patch("/apps/{app_name}/users/{user_id}/sessions/{session_id}")
     async def update_session_state(
         app_name: str,
         user_id: str,
         session_id: str,
-        request: UpdateSessionStateRequest,
+        request: UpdateSessionRequest,
     ):
         """Update session state."""
         session = await server.session_service.get_session(
@@ -261,7 +245,7 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
 
     @router.post("/run")
     async def run_agent(
-        request: RunRequest,
+        request: RunAgentRequest,
         auth_info: dict = Depends(get_auth_info),
     ):
         """
@@ -300,20 +284,26 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
                 user_id=request.user_id,
                 session_id=request.session_id,
             )
+
+            # Merge auth info with request state_delta
+            combined_state_delta = {"_auth": auth_info}
+            if request.state_delta:
+                combined_state_delta.update(request.state_delta)
+
             if not session:
-                # Create session with auth info in initial state
+                # Create session with auth info and state delta in initial state
                 session = await server.session_service.create_session(
                     app_name=request.app_name,
                     user_id=request.user_id,
                     session_id=request.session_id,
-                    state={"_auth": auth_info},
+                    state=combined_state_delta,
                 )
             else:
-                # Update existing session with auth info
+                # Update existing session with auth info and state delta
                 # This persists to DB so the runner sees it when it fetches the session
                 await server.session_service.update_session_state(
                     session=session,
-                    state_delta={"_auth": auth_info},
+                    state_delta=combined_state_delta,
                 )
 
             # Convert message to ADK Content
@@ -326,12 +316,18 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
                 ],
             )
 
+            # Prepare runner.run_async kwargs
+            run_kwargs = {
+                "user_id": request.user_id,
+                "session_id": request.session_id,
+                "new_message": new_message,
+            }
+            # Add state_delta if provided
+            if request.state_delta:
+                run_kwargs["state_delta"] = request.state_delta
+
             events = []
-            async for event in runner.run_async(
-                user_id=request.user_id,
-                session_id=request.session_id,
-                new_message=new_message,
-            ):
+            async for event in runner.run_async(**run_kwargs):
                 events.append(_serialize_event(event))
 
             return {"events": events}
@@ -342,7 +338,7 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
 
     @router.post("/run_sse")
     async def run_agent_sse(
-        request: RunRequest,
+        request: RunAgentRequest,
         auth_info: dict = Depends(get_auth_info),
     ):
         """
@@ -381,19 +377,25 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
                 user_id=request.user_id,
                 session_id=request.session_id,
             )
+
+            # Merge auth info with request state_delta
+            combined_state_delta = {"_auth": auth_info}
+            if request.state_delta:
+                combined_state_delta.update(request.state_delta)
+
             if not session:
-                # Create session with auth info in initial state
+                # Create session with auth info and state delta in initial state
                 session = await server.session_service.create_session(
                     app_name=request.app_name,
                     user_id=request.user_id,
                     session_id=request.session_id,
-                    state={"_auth": auth_info},
+                    state=combined_state_delta,
                 )
             else:
-                # Update existing session with auth info
+                # Update existing session with auth info and state delta
                 await server.session_service.update_session_state(
                     session=session,
-                    state_delta={"_auth": auth_info},
+                    state_delta=combined_state_delta,
                 )
 
             # Convert message to ADK Content
@@ -408,25 +410,63 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
 
             async def generate():
                 try:
-                    async for event in runner.run_async(
-                        user_id=request.user_id,
-                        session_id=request.session_id,
-                        new_message=new_message,
-                    ):
-                        data = json.dumps(_serialize_event(event))
-                        yield f"data: {data}\n\n"
-                    yield "data: [DONE]\n\n"
+                    from google.adk.agents.run_config import RunConfig, StreamingMode
+
+                    # Determine streaming mode based on request
+                    stream_mode = StreamingMode.SSE if request.streaming else StreamingMode.NONE
+
+                    # Prepare runner.run_async kwargs
+                    run_kwargs = {
+                        "user_id": request.user_id,
+                        "session_id": request.session_id,
+                        "new_message": new_message,
+                        "run_config": RunConfig(streaming_mode=stream_mode),
+                    }
+                    # Add state_delta and invocation_id if provided
+                    if request.state_delta:
+                        run_kwargs["state_delta"] = request.state_delta
+                    if request.invocation_id:
+                        run_kwargs["invocation_id"] = request.invocation_id
+
+                    async for event in runner.run_async(**run_kwargs):
+                        # Handle artifact_delta splitting like official ADK server
+                        # This ensures proper rendering in ADK Web UI
+                        events_to_stream = [event]
+                        if (
+                            hasattr(event, "actions") and
+                            hasattr(event.actions, "artifact_delta") and
+                            event.actions.artifact_delta and
+                            hasattr(event, "content") and
+                            event.content and
+                            hasattr(event.content, "parts") and
+                            event.content.parts
+                        ):
+                            # Split into content event and artifact event
+                            content_event = event.model_copy(deep=True)
+                            content_event.actions.artifact_delta = {}
+                            artifact_event = event.model_copy(deep=True)
+                            artifact_event.content = None
+                            events_to_stream = [content_event, artifact_event]
+
+                        for event_to_stream in events_to_stream:
+                            # Use model_dump_json for proper serialization
+                            if hasattr(event_to_stream, "model_dump_json"):
+                                sse_event = event_to_stream.model_dump_json(
+                                    exclude_none=True,
+                                    by_alias=True,
+                                )
+                            else:
+                                sse_event = json.dumps(_serialize_event(event_to_stream))
+                            logger.debug("Generated SSE event: %s", sse_event[:200])
+                            yield f"data: {sse_event}\n\n"
+
                 except Exception as e:
                     logger.exception("Error in SSE stream: %s", e)
-                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                    yield f'data: {{"error": "{str(e)}"}}\n\n'
 
             return StreamingResponse(
                 generate(),
                 media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                }
             )
 
         except Exception as e:
@@ -582,7 +622,7 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
     async def add_to_memory(
         app_name: str,
         user_id: str,
-        request: AddSessionToMemoryRequest,
+        request: UpdateMemoryRequest,
     ):
         """Add a session to memory."""
         if not server.memory_service:
@@ -707,97 +747,42 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
         )
         return {"deleted": True}
 
-    # -------------------------------------------------------------------------
-    # Evaluation
-    # -------------------------------------------------------------------------
-
-    @router.post("/apps/{app_name}/eval-sets")
-    async def create_eval_set(app_name: str, request: CreateEvalSetRequest):
-        """Create an evaluation set."""
-        if not server.eval_sets_manager:
-            raise HTTPException(status_code=501, detail="Eval sets manager not configured")
-
-        await server.eval_sets_manager.create_eval_set(
-            app_name=app_name,
-            eval_set_id=request.eval_set_id,
-        )
-        return {"eval_set_id": request.eval_set_id}
-
-    @router.get("/apps/{app_name}/eval-sets")
-    async def list_eval_sets(app_name: str):
-        """List evaluation sets."""
-        if not server.eval_sets_manager:
-            raise HTTPException(status_code=501, detail="Eval sets manager not configured")
-
-        eval_sets = await server.eval_sets_manager.list_eval_sets(app_name=app_name)
-        return {"eval_sets": eval_sets}
-
-    @router.get("/apps/{app_name}/eval-sets/{eval_set_id}")
-    async def get_eval_set(app_name: str, eval_set_id: str):
-        """Get an evaluation set."""
-        if not server.eval_sets_manager:
-            raise HTTPException(status_code=501, detail="Eval sets manager not configured")
-
-        eval_set = await server.eval_sets_manager.get_eval_set(
-            app_name=app_name,
-            eval_set_id=eval_set_id,
-        )
-        if not eval_set:
-            raise HTTPException(status_code=404, detail="Eval set not found")
-        return eval_set
-
-    @router.post("/apps/{app_name}/eval-sets/{eval_set_id}/add-session")
-    async def add_session_to_eval(
-        app_name: str,
-        eval_set_id: str,
-        request: AddSessionToEvalRequest,
-    ):
-        """Add a session to an evaluation set."""
-        if not server.eval_sets_manager:
-            raise HTTPException(status_code=501, detail="Eval sets manager not configured")
-
-        await server.eval_sets_manager.add_session_to_eval_set(
-            app_name=app_name,
-            eval_set_id=eval_set_id,
-            session_id=request.session_id,
-        )
-        return {"added": True}
-
-    @router.post("/apps/{app_name}/eval-sets/{eval_set_id}/run")
-    async def run_eval(
-        app_name: str,
-        eval_set_id: str,
-        request: Optional[RunEvalRequest] = None,
-    ):
-        """Run an evaluation."""
-        if not server.eval_sets_manager:
-            raise HTTPException(status_code=501, detail="Eval sets manager not configured")
-
-        # This would typically run the evaluation asynchronously
-        # For now, return a placeholder
-        return {
-            "status": "started",
-            "eval_set_id": eval_set_id,
-            "message": "Evaluation started (implement actual eval logic)",
-        }
-
-    @router.get("/apps/{app_name}/eval-results")
-    async def list_eval_results(app_name: str):
-        """List evaluation results."""
-        if not server.eval_set_results_manager:
-            raise HTTPException(status_code=501, detail="Eval results manager not configured")
-
-        results = await server.eval_set_results_manager.list_eval_set_results(
-            app_name=app_name,
-        )
-        return {"results": results}
-
     return router
 
 
 # =============================================================================
 # Helpers
 # =============================================================================
+
+def _serialize_content(content: Any) -> Dict[str, Any]:
+    """Serialize ADK Content to JSON-compatible dict."""
+    result = {
+        "role": getattr(content, "role", "user"),
+        "parts": [],
+    }
+
+    if hasattr(content, "parts") and content.parts:
+        for part in content.parts:
+            part_data = {}
+            if hasattr(part, "text") and part.text:
+                part_data["text"] = part.text
+            if hasattr(part, "function_call") and part.function_call:
+                fc = part.function_call
+                part_data["functionCall"] = {
+                    "name": fc.name,
+                    "args": fc.args if hasattr(fc, "args") else {},
+                }
+            if hasattr(part, "function_response") and part.function_response:
+                fr = part.function_response
+                part_data["functionResponse"] = {
+                    "name": fr.name,
+                    "response": fr.response if hasattr(fr, "response") else {},
+                }
+            if part_data:
+                result["parts"].append(part_data)
+
+    return result
+
 
 def _serialize_event(event: Any) -> Dict[str, Any]:
     """Serialize an ADK event to JSON-compatible dict."""
@@ -807,29 +792,6 @@ def _serialize_event(event: Any) -> Dict[str, Any]:
     }
 
     if hasattr(event, "content") and event.content:
-        content = event.content
-        result["content"] = {
-            "role": content.role,
-            "parts": [],
-        }
-        if content.parts:
-            for part in content.parts:
-                part_data = {}
-                if hasattr(part, "text") and part.text:
-                    part_data["text"] = part.text
-                if hasattr(part, "function_call") and part.function_call:
-                    fc = part.function_call
-                    part_data["function_call"] = {
-                        "name": fc.name,
-                        "args": fc.args,
-                    }
-                if hasattr(part, "function_response") and part.function_response:
-                    fr = part.function_response
-                    part_data["function_response"] = {
-                        "name": fr.name,
-                        "response": fr.response,
-                    }
-                if part_data:
-                    result["content"]["parts"].append(part_data)
+        result["content"] = _serialize_content(event.content)
 
     return result
