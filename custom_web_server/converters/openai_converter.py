@@ -4,12 +4,15 @@ Converter between OpenAI and ADK formats.
 
 import base64
 import json
+import logging
 import uuid
 from typing import Any, Dict, List
 
 from google.genai import types
 
 from ..models.openai_models import OpenAIMessage
+
+logger = logging.getLogger(__name__)
 
 
 class OpenAIConverter:
@@ -78,6 +81,11 @@ class OpenAIConverter:
         """
         Format ADK events as OpenAI chat completion response.
 
+        Includes reasoning/thinking content in the response following the format
+        used by providers like OpenRouter/LiteLLM:
+        - message.reasoning: The full reasoning text
+        - message.reasoning_details: Array of reasoning items with type/text
+
         Args:
             events: List of ADK events
             model: Model name
@@ -86,15 +94,25 @@ class OpenAIConverter:
         Returns:
             OpenAI format response dict
         """
-        # Collect all text content from events
+        # Collect text content, separating thinking from visible content
         full_text = ""
+        thinking_parts = []
         tool_calls = []
 
         for event in events:
             if event.content and event.content.parts:
                 for part in event.content.parts:
+                    # Check if this is thinking/reasoning content
+                    is_thought = getattr(part, 'thought', False)
+
                     if hasattr(part, 'text') and part.text:
-                        full_text += part.text
+                        if is_thought:
+                            # Collect thinking parts
+                            thinking_parts.append(part.text)
+                        else:
+                            # Non-thinking text goes in content
+                            full_text += part.text
+
                     if hasattr(part, 'function_call') and part.function_call:
                         fc = part.function_call
                         tool_calls.append({
@@ -106,16 +124,36 @@ class OpenAIConverter:
                             }
                         })
 
-        # Build response
+        # Build response message with reasoning fields
         message = {
             "role": "assistant",
-            "content": full_text if full_text else None
+            "content": full_text if full_text else None,
+            "refusal": None,
+            "annotations": None,
+            "audio": None,
+            "function_call": None,
+            "tool_calls": tool_calls if tool_calls else None,
         }
 
-        if tool_calls:
-            message["tool_calls"] = tool_calls
+        # Add reasoning content if present (like OpenRouter/LiteLLM format)
+        thinking_text = "\n".join(thinking_parts)
+        if thinking_text:
+            message["reasoning"] = thinking_text
+            message["reasoning_details"] = [
+                {
+                    "type": "reasoning.text",
+                    "format": "text",
+                    "index": idx,
+                    "text": part
+                }
+                for idx, part in enumerate(thinking_parts)
+            ]
 
         finish_reason = "tool_calls" if tool_calls else "stop"
+
+        # Estimate token counts (rough approximation: ~4 chars per token)
+        completion_tokens = len(full_text) // 4
+        reasoning_tokens = len(thinking_text) // 4
 
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -125,12 +163,19 @@ class OpenAIConverter:
             "choices": [{
                 "index": 0,
                 "message": message,
+                "logprobs": None,
                 "finish_reason": finish_reason
             }],
             "usage": {
                 "prompt_tokens": 0,  # ADK doesn't provide this directly
-                "completion_tokens": len(full_text) // 4,  # Rough estimate
-                "total_tokens": len(full_text) // 4
+                "completion_tokens": completion_tokens + reasoning_tokens,
+                "total_tokens": completion_tokens + reasoning_tokens,
+                "completion_tokens_details": {
+                    "reasoning_tokens": reasoning_tokens,
+                    "audio_tokens": 0,
+                    "accepted_prediction_tokens": None,
+                    "rejected_prediction_tokens": None
+                }
             }
         }
 
@@ -145,6 +190,9 @@ class OpenAIConverter:
     ) -> Dict[str, Any]:
         """
         Format a single ADK event as OpenAI streaming chunk.
+
+        Includes reasoning/thinking content in the delta following the format
+        used by providers like OpenRouter/LiteLLM.
 
         Args:
             event: ADK event
@@ -163,9 +211,18 @@ class OpenAIConverter:
             delta["role"] = "assistant"
 
         if event.content and event.content.parts:
+            text_parts = []
+            reasoning_parts = []
+
             for part in event.content.parts:
+                is_thought = getattr(part, 'thought', False)
+
                 if hasattr(part, 'text') and part.text:
-                    delta["content"] = part.text
+                    if is_thought:
+                        reasoning_parts.append(part.text)
+                    else:
+                        text_parts.append(part.text)
+
                 if hasattr(part, 'function_call') and part.function_call:
                     fc = part.function_call
                     delta["tool_calls"] = [{
@@ -177,6 +234,14 @@ class OpenAIConverter:
                             "arguments": json.dumps(fc.args) if fc.args else "{}"
                         }
                     }]
+
+            # Include visible content
+            if text_parts:
+                delta["content"] = "".join(text_parts)
+
+            # Include reasoning content (like OpenRouter/LiteLLM format)
+            if reasoning_parts:
+                delta["reasoning"] = "\n".join(reasoning_parts)
 
         finish_reason = None
         if is_last:
@@ -190,6 +255,29 @@ class OpenAIConverter:
             "choices": [{
                 "index": 0,
                 "delta": delta,
+                "logprobs": None,
                 "finish_reason": finish_reason
             }]
         }
+
+    @staticmethod
+    def has_visible_content(event: Any) -> bool:
+        """
+        Check if an event has any visible content (text, reasoning, or function calls).
+
+        Args:
+            event: ADK event
+
+        Returns:
+            True if event has visible content, False otherwise
+        """
+        if not event.content or not event.content.parts:
+            return False
+
+        for part in event.content.parts:
+            if (hasattr(part, 'text') and part.text) or \
+               (hasattr(part, 'function_call') and part.function_call) or \
+               (hasattr(part, 'function_response') and part.function_response):
+                return True
+
+        return False

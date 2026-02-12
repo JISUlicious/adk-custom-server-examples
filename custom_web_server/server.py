@@ -284,7 +284,7 @@ class CustomWebServer:
             import google.adk.cli
 
             adk_cli_path = Path(google.adk.cli.__file__).parent
-            web_assets_path = adk_cli_path / "browser" / "dist"
+            web_assets_path = adk_cli_path / "browser"
 
             if web_assets_path.exists():
                 app.mount(

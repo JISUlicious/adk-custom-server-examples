@@ -12,6 +12,8 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from google.adk.agents.run_config import RunConfig, StreamingMode
+
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from google.genai import types
@@ -41,14 +43,35 @@ class UpdateSessionStateRequest(BaseModel):
 
 
 class RunRequest(BaseModel):
-    """Request to run an agent."""
+    """Request to run an agent.
+
+    Supports both ADK Web UI format and direct API format.
+    """
     app_name: str = Field(alias="appName")
     user_id: str = Field(alias="userId")
     session_id: str = Field(alias="sessionId")
-    new_message: Dict[str, Any]
-    streaming: bool = False
+
+    # ADK Web UI sends "messages" array, direct API might send "new_message"
+    new_message: Optional[Dict[str, Any]] = Field(default=None, alias="newMessage")
+    messages: Optional[List[Dict[str, Any]]] = None
+
+    # Accept both "stream" (from UI) and "streaming" (API style)
+    streaming: bool = Field(default=False, alias="stream")
 
     model_config = {"populate_by_name": True}  # Accept both snake_case and camelCase
+
+    def get_new_message(self) -> Dict[str, Any]:
+        """Get the new message, handling both formats."""
+        if self.new_message:
+            return self.new_message
+        if self.messages:
+            # Get the last user message from the messages array
+            for msg in reversed(self.messages):
+                if msg.get("role") == "user":
+                    return msg
+            # Fallback to last message
+            return self.messages[-1] if self.messages else {"role": "user", "parts": []}
+        return {"role": "user", "parts": []}
 
 
 class AddSessionToMemoryRequest(BaseModel):
@@ -318,11 +341,12 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
                 )
 
             # Convert message to ADK Content
+            msg = request.get_new_message()
             new_message = types.Content(
-                role=request.new_message.get("role", "user"),
+                role=msg.get("role", "user"),
                 parts=[
                     types.Part.from_text(text=p.get("text", ""))
-                    for p in request.new_message.get("parts", [])
+                    for p in msg.get("parts", [])
                     if p.get("text")
                 ],
             )
@@ -399,14 +423,19 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
                 )
 
             # Convert message to ADK Content
+            msg = request.get_new_message()
             new_message = types.Content(
-                role=request.new_message.get("role", "user"),
+                role=msg.get("role", "user"),
                 parts=[
                     types.Part.from_text(text=p.get("text", ""))
-                    for p in request.new_message.get("parts", [])
+                    for p in msg.get("parts", [])
                     if p.get("text")
                 ],
             )
+
+            # Configure streaming mode
+            stream_mode = StreamingMode.SSE if request.streaming else StreamingMode.NONE
+            run_config = RunConfig(streaming_mode=stream_mode)
 
             async def generate():
                 try:
@@ -414,7 +443,16 @@ def create_adk_router(server: "CustomWebServer") -> APIRouter:
                         user_id=request.user_id,
                         session_id=request.session_id,
                         new_message=new_message,
+                        run_config=run_config,
                     ):
+                        # Debug: check for thought/reasoning content
+                        if event.content and event.content.parts:
+                            for part in event.content.parts:
+                                if hasattr(part, 'thought') and part.thought:
+                                    print(f"[ADK DEBUG] Found thought=True: {part.text[:50] if part.text else 'N/A'}...")
+                                if hasattr(part, 'text') and part.text:
+                                    print(f"[ADK DEBUG] Part: thought={getattr(part, 'thought', None)}, text={part.text[:30]}...")
+
                         # Handle artifact_delta splitting like official ADK server
                         # This ensures proper rendering in ADK Web UI
                         events_to_stream = [event]

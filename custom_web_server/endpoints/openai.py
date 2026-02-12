@@ -237,38 +237,44 @@ async def _handle_streaming(
                 new_message=new_message,
                 run_config=run_config,
             ):
-                # Only emit events with content
-                if event.content and event.content.parts:
-                    has_content = any(
-                        (hasattr(p, 'text') and p.text) or
-                        (hasattr(p, 'function_call') and p.function_call)
-                        for p in event.content.parts
+                # Skip non-partial (aggregated) events to avoid duplicate text
+                # ADK's progressive SSE sends partial chunks + final aggregated event
+                # OpenAI standard only sends incremental chunks
+                if hasattr(event, 'partial') and event.partial is False:
+                    # This is the final aggregated event - skip content but use for finish
+                    last_event = event
+                    continue
+
+                # Emit partial events with visible content
+                if OpenAIConverter.has_visible_content(event):
+                    chunk = OpenAIConverter.event_to_openai_chunk(
+                        event=event,
+                        model=model,
+                        created=created,
+                        chunk_id=chunk_id,
+                        is_first=is_first,
+                        is_last=False
                     )
-                    if has_content:
-                        chunk = OpenAIConverter.event_to_openai_chunk(
-                            event=event,
-                            model=model,
-                            created=created,
-                            chunk_id=chunk_id,
-                            is_first=is_first,
-                            is_last=False
-                        )
+                    delta = chunk["choices"][0]["delta"]
+                    if delta.get("content") or delta.get("reasoning") or delta.get("tool_calls"):
                         yield f"data: {json.dumps(chunk)}\n\n"
                         is_first = False
                         last_event = event
 
-            # Send final chunk with finish_reason
+            # Send final chunk with finish_reason (empty delta, just signals completion)
             if last_event:
-                final_chunk = OpenAIConverter.event_to_openai_chunk(
-                    event=last_event,
-                    model=model,
-                    created=created,
-                    chunk_id=chunk_id,
-                    is_first=False,
-                    is_last=True
-                )
-                # Clear delta content for final chunk
-                final_chunk["choices"][0]["delta"] = {}
+                final_chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "logprobs": None,
+                        "finish_reason": "stop"
+                    }]
+                }
                 yield f"data: {json.dumps(final_chunk)}\n\n"
 
             yield "data: [DONE]\n\n"

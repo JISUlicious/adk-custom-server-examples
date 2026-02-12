@@ -9,6 +9,10 @@ A full-featured web server providing:
 - Authorization plugin support
 """
 
+# Apply patches to fix ADK bugs before importing anything else
+from .patches import apply_all_patches
+apply_all_patches()
+
 from .config import ServerConfig
 from .server import CustomWebServer, create_server
 from .services import ServiceContainer
